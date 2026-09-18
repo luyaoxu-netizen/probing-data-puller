@@ -1,0 +1,213 @@
+/**
+ * Automatically fetches completed wafer probing emails from @chipbond.com.tw,
+ * strictly enforces required headers, and saves CSVs to Google Drive.
+ */
+
+function extractChipbondWaferTables() {
+  const folderPath = ["claude code work", "wafer_ftp_puller", "datatable"];
+  const targetFolder = getOrCreateFolderPath(folderPath);
+
+  const searchQuery = 'from:@chipbond.com.tw';
+  const threads = GmailApp.search(searchQuery, 0, 100);
+  const seenHashes = new Set();
+
+  if (threads.length === 0) {
+    Logger.log("No matching emails found from @chipbond.com.tw.");
+    return "No matching emails found from @chipbond.com.tw.";
+  }
+
+  let processedCount = 0;
+  let summaryMessages = [];
+
+  threads.forEach(thread => {
+    const messages = thread.getMessages();
+    messages.forEach(message => {
+      const subject = message.getSubject();
+      const sender = message.getFrom();
+
+      // STRICT FILTER: Skip any individual message NOT sent directly from @chipbond.com.tw
+      if (!sender.toLowerCase().includes("@chipbond.com.tw")) {
+        return;
+      }
+
+      const date = message.getDate();
+      const htmlBody = message.getBody();
+
+      const extractedTable = parseStrictChipbondTable(htmlBody);
+
+      if (extractedTable) {
+        const tableString = JSON.stringify(extractedTable);
+        const tableHash = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, tableString)
+                            .map(byte => (byte < 0 ? byte + 256 : byte).toString(16).padStart(2, '0'))
+                            .join('');
+
+        if (seenHashes.has(tableHash)) {
+          Logger.log("Skipping duplicate table content.");
+          return; 
+        }
+        seenHashes.add(tableHash);
+
+        const timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyyMMdd_HHmmss");
+
+        let dieID = extractedTable[1] && extractedTable[1][1] ? extractedTable[1][1].replace(/[^a-zA-Z0-9_\-]/g, '') : "Device";
+        let lotId = "data";
+        if (extractedTable[1] && extractedTable[1][2]) {
+          lotId = extractedTable[1][2].replace(/[^a-zA-Z0-9_\-]/g, '');
+        }
+
+        const fileName = `wafer_probing_${dieID}_${lotId}_${timestamp}.csv`;
+        const csvContent = convertToCsv(extractedTable);
+
+        targetFolder.createFile(fileName, csvContent, MimeType.CSV);
+        message.markRead();
+
+        processedCount++;
+        const logEntry = `PULLED: ${fileName} (Subject: ${subject})`;
+        Logger.log(logEntry);
+        summaryMessages.push(logEntry);
+      }
+    });
+  });
+
+  const resultSummary = processedCount > 0 
+    ? `Successfully processed ${processedCount} probing table(s).`
+    : "Scanned emails, but found no new valid probing tables.";
+    
+  Logger.log(resultSummary);
+  return resultSummary;
+}
+
+/**
+ * Handles incoming web requests from Python Control Panel
+ */
+function doGet(e) {
+  try {
+    const result = extractChipbondWaferTables();
+    return ContentService.createTextOutput(result);
+  } catch (err) {
+    return ContentService.createTextOutput("Error executing script: " + err.toString());
+  }
+}
+
+/**
+ * Parses HTML body and enforces strict structure
+ */
+function parseStrictChipbondTable(htmlString) {
+  const strictHeaders = ["Purpose/Request", "Device", "WaferLot", "Slot#", "Tester", "Probe card", "Test program", "*.csv", "*.xlsx", "Path"];
+  const tableRegex = /<table[^>]*>([\s\S]*?)<\/table>/gi;
+  let tableMatch;
+
+  while ((tableMatch = tableRegex.exec(htmlString)) !== null) {
+    const tableContent = tableMatch[1];
+    const rows = [];
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let rowMatch;
+
+    while ((rowMatch = rowRegex.exec(tableContent)) !== null) {
+      const rowContent = rowMatch[1];
+      const cells = [];
+      const cellRegex = /<(?:td|th)[^>]*>([\s\S]*?)<\/(?:td|th)>/gi;
+      let cellMatch;
+
+      while ((cellMatch = cellRegex.exec(rowContent)) !== null) {
+        let cellText = cellMatch[1].replace(/<[^>]+>/g, '').trim();
+        cellText = cellText.replace(/&nbsp;/gi, ' ');
+        cells.push(cellText);
+      }
+
+      if (cells.length > 0) {
+        rows.push(cells);
+      }
+    }
+
+    if (rows.length >= 2) {
+      const flattenedText = rows.map(r => r.join(" ")).join(" ");
+      const hasAllHeaders = strictHeaders.every(header => 
+        flattenedText.toLowerCase().includes(header.toLowerCase())
+      );
+
+      const pathMatch = flattenedText.match(/Path[\s\:\t]+([^\s]+)/i) || flattenedText.match(/\\Avago\\[^\s]+/i);
+
+      if (hasAllHeaders) {
+        let headerRowIndex = -1;
+        for (let i = 0; i < rows.length; i++) {
+          if (rows[i].some(cell => cell.toLowerCase().includes("device")) && 
+              rows[i].some(cell => cell.toLowerCase().includes("waferlot"))) {
+            headerRowIndex = i;
+            break;
+          }
+        }
+
+        if (headerRowIndex !== -1 && rows[headerRowIndex + 1]) {
+          const dataRow = rows[headerRowIndex + 1];
+          const cleanTable = [
+            strictHeaders,
+            [
+              extractPurposeValue(rows) || "Probe whole wafer",
+              dataRow[0] || "",
+              dataRow[1] || "",
+              dataRow[2] || "",
+              dataRow[3] || "",
+              dataRow[4] || "",
+              dataRow[5] || "",
+              dataRow[6] || "",
+              dataRow[7] || "",
+              extractPathValue(rows) || (pathMatch ? pathMatch[0] : "")
+            ]
+          ];
+
+          if (cleanTable[1][9] && cleanTable[1][9].trim().length > 3) {
+            return cleanTable;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function extractPurposeValue(rows) {
+  for (let r of rows) {
+    const line = r.join(" ");
+    if (line.toLowerCase().includes("purpose") || line.toLowerCase().includes("request")) {
+      return line.replace(/Purpose\/Request/i, '').trim();
+    }
+  }
+  return "";
+}
+
+function extractPathValue(rows) {
+  for (let r of rows) {
+    const line = r.join(" ");
+    if (line.toLowerCase().includes("path")) {
+      return line.replace(/Path/i, '').trim();
+    }
+  }
+  return "";
+}
+
+function convertToCsv(dataArray) {
+  return dataArray.map(row => {
+    return row.map(cell => {
+      let cleanCell = String(cell).replace(/"/g, '""');
+      if (cleanCell.includes(',') || cleanCell.includes('\n') || cleanCell.includes('"')) {
+        cleanCell = `"${cleanCell}"`;
+      }
+      return cleanCell;
+    }).join(',');
+  }).join('\n');
+}
+
+function getOrCreateFolderPath(pathArray) {
+  let currentFolder = DriveApp.getRootFolder();
+  for (let i = 0; i < pathArray.length; i++) {
+    const folderName = pathArray[i];
+    const subFolders = currentFolder.getFoldersByName(folderName);
+    if (subFolders.hasNext()) {
+      currentFolder = subFolders.next();
+    } else {
+      currentFolder = currentFolder.createFolder(folderName);
+    }
+  }
+  return currentFolder;
+}
